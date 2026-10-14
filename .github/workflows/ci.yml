@@ -1,9 +1,11 @@
 name: CI Build
 
 on:
+  workflow_dispatch:
   push:
     branches:
     - main
+    - 'feat/**'
     tags:
     - 'v*'
   pull_request:
