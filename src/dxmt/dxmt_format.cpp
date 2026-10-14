@@ -1069,6 +1069,37 @@ MTLQueryDXGIFormat(WMT::Device device, uint32_t format, MTL_DXGI_FORMAT_DESC &de
   return S_OK;
 }
 
+bool
+MTLQueryDXGIPlanarFormat(uint32_t format, MTL_DXGI_PLANAR_FORMAT_DESC &description) {
+  switch (format) {
+  case DXGI_FORMAT_NV12:
+    description.PlaneCount = 2;
+    description.PlaneFormat[0] = DXGI_FORMAT_R8_UNORM;
+    description.PlaneFormat[1] = DXGI_FORMAT_R8G8_UNORM;
+    description.PlanePixelFormat[0] = WMTPixelFormatR8Unorm;
+    description.PlanePixelFormat[1] = WMTPixelFormatRG8Unorm;
+    description.PlaneBytesPerTexel[0] = 1;
+    description.PlaneBytesPerTexel[1] = 2;
+    description.PlaneSubsampleShift[0] = 0;
+    description.PlaneSubsampleShift[1] = 1;
+    return true;
+  case DXGI_FORMAT_P010:
+  case DXGI_FORMAT_P016:
+    description.PlaneCount = 2;
+    description.PlaneFormat[0] = DXGI_FORMAT_R16_UNORM;
+    description.PlaneFormat[1] = DXGI_FORMAT_R16G16_UNORM;
+    description.PlanePixelFormat[0] = WMTPixelFormatR16Unorm;
+    description.PlanePixelFormat[1] = WMTPixelFormatRG16Unorm;
+    description.PlaneBytesPerTexel[0] = 2;
+    description.PlaneBytesPerTexel[1] = 4;
+    description.PlaneSubsampleShift[0] = 0;
+    description.PlaneSubsampleShift[1] = 1;
+    return true;
+  default:
+    return false;
+  }
+}
+
 uint32_t
 MTLGetTexelSize(WMTPixelFormat format) {
   switch (ORIGINAL_FORMAT(format)) {

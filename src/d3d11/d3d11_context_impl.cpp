@@ -1078,6 +1078,11 @@ public:
     case D3D11_RESOURCE_DIMENSION_TEXTURE2D: {
       D3D11_TEXTURE2D_DESC1 desc;
       ((ID3D11Texture2D1 *)pSrcResource)->GetDesc1(&desc);
+      if (IsPlanarCopy(Dst, Src)) {
+        for (unsigned slice = 0; slice < desc.ArraySize; slice++)
+          CopyPlanarTexture(Dst, slice, 0, 0, Src, slice, nullptr);
+        break;
+      }
       for (auto sub : EnumerateSubresources(desc)) {
         CopyTexture(TextureCopyCommand(Dst, sub.SubresourceId, 0, 0, 0, Src, sub.SubresourceId, nullptr));
       }
@@ -1134,6 +1139,10 @@ public:
     default:
       if (Src.Dimension == D3D11_RESOURCE_DIMENSION_BUFFER)
         return;
+      if (IsPlanarCopy(Dst, Src)) {
+        CopyPlanarTexture(Dst, DstSubresource, DstX, DstY, Src, SrcSubresource, pSrcBox);
+        break;
+      }
       CopyTexture(TextureCopyCommand(Dst, DstSubresource, DstX, DstY, DstZ, Src, SrcSubresource, pSrcBox));
       break;
     }
@@ -3904,6 +3913,156 @@ public:
       }
     } else {
       UNREACHABLE
+    }
+  }
+
+  bool
+  IsPlanarCopy(BlitObject &Dst, BlitObject &Src) {
+    MTL_DXGI_PLANAR_FORMAT_DESC planar;
+    return (Dst.Dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D &&
+            MTLQueryDXGIPlanarFormat(Dst.Texture2DDesc.Format, planar)) ||
+           (Src.Dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D &&
+            MTLQueryDXGIPlanarFormat(Src.Texture2DDesc.Format, planar));
+  }
+
+  /**
+   * Copies all planes of one subresource of a multi-planar texture. As in D3D11, the subresource index does not
+   * select a plane, and the source box and destination origin are in luma texels.
+   */
+  void
+  CopyPlanarTexture(
+      BlitObject &Dst, UINT DstSubresource, UINT DstX, UINT DstY, BlitObject &Src, UINT SrcSubresource,
+      const D3D11_BOX *pSrcBox
+  ) {
+    if (Dst.Dimension != D3D11_RESOURCE_DIMENSION_TEXTURE2D || Src.Dimension != D3D11_RESOURCE_DIMENSION_TEXTURE2D)
+      return;
+    auto &dst_desc = Dst.Texture2DDesc;
+    auto &src_desc = Src.Texture2DDesc;
+    if (dst_desc.Format != src_desc.Format) {
+      WARN("CopyPlanarTexture: copy between ", src_desc.Format, " and ", dst_desc.Format, " is not supported");
+      return;
+    }
+    MTL_DXGI_PLANAR_FORMAT_DESC planar;
+    MTLQueryDXGIPlanarFormat(dst_desc.Format, planar);
+    if (DstSubresource >= dst_desc.ArraySize || SrcSubresource >= src_desc.ArraySize)
+      return;
+
+    D3D11_BOX box = {0, 0, 0, src_desc.Width, src_desc.Height, 1};
+    if (pSrcBox) {
+      box = *pSrcBox;
+      box.right = std::min(box.right, src_desc.Width);
+      box.bottom = std::min(box.bottom, src_desc.Height);
+      if (box.left >= box.right || box.top >= box.bottom || box.front >= box.back)
+        return;
+    }
+    if (DstX + (box.right - box.left) > dst_desc.Width || DstY + (box.bottom - box.top) > dst_desc.Height)
+      return;
+
+    uint32_t dst_bytes_per_row = 0, dst_plane1_offset = 0, dst_bytes_per_slice;
+    uint32_t src_bytes_per_row = 0, src_plane1_offset = 0, src_bytes_per_slice;
+    auto staging_dst = GetStagingResource(Dst.pResource, DstSubresource);
+    auto staging_src = GetStagingResource(Src.pResource, SrcSubresource);
+    if (staging_dst)
+      GetPlanarLinearTextureLayout(device, dst_desc, dst_bytes_per_row, dst_plane1_offset, dst_bytes_per_slice);
+    if (staging_src)
+      GetPlanarLinearTextureLayout(device, src_desc, src_bytes_per_row, src_plane1_offset, src_bytes_per_slice);
+
+    for (unsigned plane = 0; plane < planar.PlaneCount; plane++) {
+      auto shift = planar.PlaneSubsampleShift[plane];
+      auto texel_size = planar.PlaneBytesPerTexel[plane];
+      WMTOrigin src_origin = {box.left >> shift, box.top >> shift, 0};
+      WMTOrigin dst_origin = {DstX >> shift, DstY >> shift, 0};
+      WMTSize size = {
+          ((box.right - box.left) + (1u << shift) - 1) >> shift, ((box.bottom - box.top) + (1u << shift) - 1) >> shift, 1
+      };
+      uint32_t dst_plane_offset = plane ? dst_plane1_offset : 0;
+      uint32_t src_plane_offset = plane ? src_plane1_offset : 0;
+      uint32_t dst_plane_height = dst_desc.Height >> shift;
+
+      if (staging_dst && staging_src) {
+        SwitchToBlitEncoder(CommandBufferState::BlitEncoderActive);
+        UseCopyDestination(staging_dst);
+        UseCopySource(staging_src);
+        EmitOP([dst_ = staging_dst, src_ = staging_src, src_origin, dst_origin, size, texel_size, dst_plane_offset,
+                src_plane_offset](ArgumentEncodingContext &enc) {
+          auto [src, src_sub_offset] = enc.access(src_->buffer(), 0, src_->length, ResourceAccess::Read);
+          auto [dst, dst_sub_offset] = enc.access(dst_->buffer(), 0, dst_->length, ResourceAccess::Write);
+          for (unsigned row = 0; row < size.height; row++) {
+            auto &cmd = enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_buffer>();
+            cmd.type = WMTBlitCommandCopyFromBufferToBuffer;
+            cmd.copy_length = size.width * texel_size;
+            cmd.src = src->buffer();
+            cmd.src_offset = src_sub_offset + src_plane_offset + (src_origin.y + row) * src_->bytesPerRow +
+                             src_origin.x * texel_size;
+            cmd.dst = dst->buffer();
+            cmd.dst_offset = dst_sub_offset + dst_plane_offset + (dst_origin.y + row) * dst_->bytesPerRow +
+                             dst_origin.x * texel_size;
+          }
+        });
+        promote_flush = true;
+      } else if (staging_dst) {
+        auto src = GetTexturePlane(Src.pResource, plane);
+        SwitchToBlitEncoder(CommandBufferState::ReadbackBlitEncoderActive);
+        UseCopyDestination(staging_dst);
+        EmitOP([src_ = std::move(src), dst_ = staging_dst, slice = SrcSubresource, src_origin, dst_origin, size,
+                texel_size, dst_plane_offset, dst_plane_height](ArgumentEncodingContext &enc) {
+          auto src = enc.access(src_, 0, slice, ResourceAccess::Read);
+          auto [dst, dst_offset] = enc.access(dst_->buffer(), 0, dst_->length, ResourceAccess::Write);
+          auto &cmd = enc.encodeBlitCommand<wmtcmd_blit_copy_from_texture_to_buffer>();
+          cmd.type = WMTBlitCommandCopyFromTextureToBuffer;
+          cmd.src = src;
+          cmd.slice = slice;
+          cmd.level = 0;
+          cmd.origin = src_origin;
+          cmd.size = size;
+          cmd.dst = dst->buffer();
+          cmd.offset = dst_offset + dst_plane_offset + dst_origin.y * dst_->bytesPerRow + dst_origin.x * texel_size;
+          cmd.bytes_per_row = dst_->bytesPerRow;
+          cmd.bytes_per_image = dst_->bytesPerRow * dst_plane_height;
+        });
+        promote_flush = true;
+      } else if (staging_src) {
+        auto dst = GetTexturePlane(Dst.pResource, plane);
+        SwitchToBlitEncoder(CommandBufferState::UpdateBlitEncoderActive);
+        UseCopySource(staging_src);
+        auto src_plane_height = src_desc.Height >> shift;
+        EmitOP([dst_ = std::move(dst), src_ = staging_src, slice = DstSubresource, src_origin, dst_origin, size,
+                texel_size, src_plane_offset, src_plane_height](ArgumentEncodingContext &enc) {
+          auto [src, src_offset] = enc.access(src_->buffer(), 0, src_->length, ResourceAccess::Read);
+          auto dst = enc.access(dst_, 0, slice, ResourceAccess::Write);
+          auto &cmd = enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_texture>();
+          cmd.type = WMTBlitCommandCopyFromBufferToTexture;
+          cmd.src = src->buffer();
+          cmd.src_offset = src_offset + src_plane_offset + src_origin.y * src_->bytesPerRow + src_origin.x * texel_size;
+          cmd.bytes_per_row = src_->bytesPerRow;
+          cmd.bytes_per_image = src_->bytesPerRow * src_plane_height;
+          cmd.size = size;
+          cmd.dst = dst;
+          cmd.slice = slice;
+          cmd.level = 0;
+          cmd.origin = dst_origin;
+        });
+      } else {
+        auto src = GetTexturePlane(Src.pResource, plane);
+        auto dst = GetTexturePlane(Dst.pResource, plane);
+        SwitchToBlitEncoder(CommandBufferState::BlitEncoderActive);
+        EmitOP([dst_ = std::move(dst), src_ = std::move(src), dst_slice = DstSubresource, src_slice = SrcSubresource,
+                src_origin, dst_origin, size](ArgumentEncodingContext &enc) {
+          auto src = enc.access(src_, 0, src_slice, ResourceAccess::Read);
+          auto dst = enc.access(dst_, 0, dst_slice, ResourceAccess::Write);
+          auto &cmd = enc.encodeBlitCommand<wmtcmd_blit_copy_from_texture_to_texture>();
+          cmd.type = WMTBlitCommandCopyFromTextureToTexture;
+          cmd.src = src;
+          cmd.src_slice = src_slice;
+          cmd.src_level = 0;
+          cmd.src_origin = src_origin;
+          cmd.src_size = size;
+          cmd.dst = dst;
+          cmd.dst_slice = dst_slice;
+          cmd.dst_level = 0;
+          cmd.dst_origin = dst_origin;
+        });
+      }
     }
   }
 

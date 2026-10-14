@@ -61,6 +61,23 @@ struct MTL_DXGI_FORMAT_DESC {
 
 int32_t MTLQueryDXGIFormat(WMT::Device device, uint32_t format, MTL_DXGI_FORMAT_DESC &description);
 
+/**
+ * Layout of a multi-planar (4:2:0) YUV format. Each plane is backed by its own texture.
+ * Plane 0 is luma at full resolution, plane 1 is interleaved chroma at half width and half height.
+ */
+struct MTL_DXGI_PLANAR_FORMAT_DESC {
+  uint32_t PlaneCount;
+  uint32_t PlaneFormat[2]; // DXGI_FORMAT of the view that addresses each plane
+  WMTPixelFormat PlanePixelFormat[2];
+  uint32_t PlaneBytesPerTexel[2];
+  uint32_t PlaneSubsampleShift[2]; // log2 of the subsampling factor, applied to both width and height
+};
+
+/**
+ * \returns true if `format` is a supported multi-planar format, filling `description`
+ */
+bool MTLQueryDXGIPlanarFormat(uint32_t format, MTL_DXGI_PLANAR_FORMAT_DESC &description);
+
 uint32_t MTLGetTexelSize(WMTPixelFormat format);
 
 WMTPixelFormat MTLGetUnsignedIntegerFormat(WMTPixelFormat format);

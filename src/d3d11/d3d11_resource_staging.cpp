@@ -1,6 +1,7 @@
 #include "d3d11_private.h"
 #include "d3d11_enumerable.hpp"
 #include "dxmt_dynamic.hpp"
+#include "dxmt_format.hpp"
 #include "dxmt_staging.hpp"
 #include "d3d11_resource.hpp"
 namespace dxmt {
@@ -138,6 +139,59 @@ HRESULT CreateStagingTextureInternal(MTLD3D11Device *pDevice,
   return S_OK;
 }
 
+/**
+ * A staging texture of a multi-planar format has one linear allocation per array slice,
+ * holding all planes in the layout returned by `GetPlanarLinearTextureLayout`.
+ */
+static HRESULT
+CreatePlanarStagingTexture2D(
+    MTLD3D11Device *pDevice, const D3D11_TEXTURE2D_DESC1 *pDesc, const D3D11_SUBRESOURCE_DATA *pInitialData,
+    ID3D11Texture2D1 **ppTexture
+) {
+  MTL_DXGI_PLANAR_FORMAT_DESC planar;
+  if (!MTLQueryDXGIPlanarFormat(pDesc->Format, planar))
+    return E_INVALIDARG;
+  if (pDesc->Width == 0 || pDesc->Height == 0 || pDesc->ArraySize == 0)
+    return E_INVALIDARG;
+  if ((pDesc->Width | pDesc->Height) & 1)
+    return E_INVALIDARG;
+  if (pDesc->MipLevels > 1 || (pDesc->MipLevels == 0 && (pDesc->Width > 1 || pDesc->Height > 1)))
+    return E_INVALIDARG;
+  if (pDesc->SampleDesc.Count != 1 || (pDesc->MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE))
+    return E_INVALIDARG;
+
+  D3D11_TEXTURE2D_DESC1 finalDesc = *pDesc;
+  finalDesc.MipLevels = 1;
+
+  uint32_t bytes_per_row, plane1_offset, bytes_per_slice;
+  if (FAILED(GetPlanarLinearTextureLayout(pDevice, finalDesc, bytes_per_row, plane1_offset, bytes_per_slice)))
+    return E_FAIL;
+
+  auto metal = pDevice->GetMTLDevice();
+  std::vector<Rc<StagingResource>> subresources;
+  for (unsigned slice = 0; slice < finalDesc.ArraySize; slice++) {
+    auto buffer = new StagingResource(metal, bytes_per_slice, bytes_per_row, bytes_per_slice);
+    if (pInitialData) {
+      auto &data = pInitialData[slice];
+      auto mapped = static_cast<char *>(buffer->mappedImmediateMemory());
+      for (unsigned plane = 0; plane < planar.PlaneCount; plane++) {
+        auto shift = planar.PlaneSubsampleShift[plane];
+        auto row_size = (finalDesc.Width >> shift) * planar.PlaneBytesPerTexel[plane];
+        auto src = static_cast<const char *>(data.pSysMem) + (plane ? size_t(data.SysMemPitch) * finalDesc.Height : 0);
+        auto dst = mapped + (plane ? plane1_offset : 0);
+        for (unsigned row = 0; row < (finalDesc.Height >> shift); row++)
+          memcpy(dst + size_t(row) * bytes_per_row, src + size_t(row) * data.SysMemPitch, row_size);
+      }
+    }
+    subresources.push_back(buffer);
+  }
+
+  *ppTexture = reinterpret_cast<ID3D11Texture2D1 *>(
+      ref(new StagingTexture<tag_texture_2d>(&finalDesc, pDevice, std::move(subresources)))
+  );
+  return S_OK;
+}
+
 HRESULT
 CreateStagingTexture1D(MTLD3D11Device *pDevice,
                        const D3D11_TEXTURE1D_DESC *pDesc,
@@ -152,6 +206,8 @@ CreateStagingTexture2D(MTLD3D11Device *pDevice,
                        const D3D11_TEXTURE2D_DESC1 *pDesc,
                        const D3D11_SUBRESOURCE_DATA *pInitialData,
                        ID3D11Texture2D1 **ppTexture) {
+  if (MTL_DXGI_PLANAR_FORMAT_DESC planar; MTLQueryDXGIPlanarFormat(pDesc->Format, planar))
+    return CreatePlanarStagingTexture2D(pDevice, pDesc, pInitialData, ppTexture);
   return CreateStagingTextureInternal<tag_texture_2d>(pDevice, pDesc,
                                                       pInitialData, ppTexture);
 }

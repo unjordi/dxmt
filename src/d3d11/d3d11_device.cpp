@@ -471,6 +471,18 @@ public:
       return S_OK;
     }
 
+    if (MTL_DXGI_PLANAR_FORMAT_DESC planar; MTLQueryDXGIPlanarFormat(Format, planar)) {
+      // Required support of NV12/P010 in "Format Support for Direct3D Feature Level 11.1 Hardware",
+      // minus video decoding/processing and resource sharing, which are not implemented for planar formats.
+      if (pFormatSupport) {
+        *pFormatSupport = D3D11_FORMAT_SUPPORT_TEXTURE2D | D3D11_FORMAT_SUPPORT_SHADER_LOAD |
+                          D3D11_FORMAT_SUPPORT_SHADER_SAMPLE | D3D11_FORMAT_SUPPORT_SHADER_GATHER |
+                          D3D11_FORMAT_SUPPORT_RENDER_TARGET | D3D11_FORMAT_SUPPORT_BLENDABLE |
+                          D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW | D3D11_FORMAT_SUPPORT_CPU_LOCKABLE;
+      }
+      return S_OK;
+    }
+
     MTL_DXGI_FORMAT_DESC metal_format;
     if (FAILED(MTLQueryDXGIFormat(GetMTLDevice(), Format, metal_format))) {
       return E_INVALIDARG;
@@ -615,6 +627,11 @@ public:
             D3D11_FORMAT_SUPPORT2_UAV_TYPED_LOAD |
             D3D11_FORMAT_SUPPORT2_UAV_TYPED_STORE |
             D3D11_FORMAT_SUPPORT2_SHAREABLE;
+        return S_OK;
+      }
+
+      if (MTL_DXGI_PLANAR_FORMAT_DESC planar; MTLQueryDXGIPlanarFormat(info->InFormat, planar)) {
+        info->OutFormatSupport2 = D3D11_FORMAT_SUPPORT2_UAV_TYPED_STORE;
         return S_OK;
       }
 
@@ -844,6 +861,20 @@ public:
       return E_INVALIDARG; // not supported yet
 
     try {
+      if (MTL_DXGI_PLANAR_FORMAT_DESC planar; MTLQueryDXGIPlanarFormat(pDesc->Format, planar)) {
+        switch (pDesc->Usage) {
+        case D3D11_USAGE_DEFAULT:
+        case D3D11_USAGE_IMMUTABLE:
+          return CreatePlanarDeviceTexture2D(this, pDesc, pInitialData, ppTexture2D);
+        case D3D11_USAGE_STAGING:
+          if (pDesc->BindFlags != 0)
+            return E_INVALIDARG;
+          return CreateStagingTexture2D(this, pDesc, pInitialData, ppTexture2D);
+        default:
+          ERR("CreateTexture2D1: dynamic planar textures are not supported");
+          return E_INVALIDARG;
+        }
+      }
       switch (pDesc->Usage) {
       case D3D11_USAGE_DEFAULT:
       case D3D11_USAGE_IMMUTABLE:

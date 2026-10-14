@@ -681,6 +681,33 @@ GetLinearTextureLayout(
   return S_OK;
 };
 
+HRESULT
+GetPlanarLinearTextureLayout(
+    MTLD3D11Device *pDevice, const D3D11_TEXTURE2D_DESC1 &Desc, uint32_t &BytesPerRow, uint32_t &Plane1Offset,
+    uint32_t &BytesPerSlice
+) {
+  MTL_DXGI_PLANAR_FORMAT_DESC planar;
+  if (!MTLQueryDXGIPlanarFormat(Desc.Format, planar)) {
+    ERR("GetPlanarLinearTextureLayout: not a planar format: ", Desc.Format);
+    return E_FAIL;
+  }
+  auto metal = pDevice->GetMTLDevice();
+  uint32_t alignment = 1;
+  for (unsigned plane = 0; plane < planar.PlaneCount; plane++) {
+    alignment = std::max<uint32_t>(
+        alignment, metal.minimumLinearTextureAlignmentForPixelFormat(planar.PlanePixelFormat[plane])
+    );
+  }
+  uint32_t bytes_per_row = 0;
+  for (unsigned plane = 0; plane < planar.PlaneCount; plane++) {
+    bytes_per_row = std::max(bytes_per_row, (Desc.Width >> planar.PlaneSubsampleShift[plane]) * planar.PlaneBytesPerTexel[plane]);
+  }
+  BytesPerRow = align(bytes_per_row, alignment);
+  Plane1Offset = BytesPerRow * Desc.Height;
+  BytesPerSlice = Plane1Offset + BytesPerRow * (Desc.Height >> planar.PlaneSubsampleShift[1]);
+  return S_OK;
+}
+
 template <>
 void DowngradeResourceDescription<D3D11_TEXTURE2D_DESC1, D3D11_TEXTURE2D_DESC>(
     D3D11_TEXTURE2D_DESC1 const &source, D3D11_TEXTURE2D_DESC *dst) {

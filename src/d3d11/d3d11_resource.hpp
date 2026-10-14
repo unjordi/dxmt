@@ -137,6 +137,8 @@ struct D3D11ResourceCommon : ID3D11Resource {
 
   Rc<Buffer> buffer_{};
   Rc<Texture> texture_{};
+  /* chroma plane of a multi-planar texture; `texture_` holds the luma plane */
+  Rc<Texture> texture_plane1_{};
   uint32_t bind_flags_{};
   Rc<KeyedMutex> keyed_mutex_{};
 
@@ -183,6 +185,11 @@ GetStagingResource(ID3D11Resource *pResource, UINT Subresource) {
 inline Rc<Texture>
 GetTexture(ID3D11Resource *pResource) {
   return static_cast<D3D11ResourceCommon *>(pResource)->texture();
+}
+inline Rc<Texture>
+GetTexturePlane(ID3D11Resource *pResource, uint32_t Plane) {
+  auto common = static_cast<D3D11ResourceCommon *>(pResource);
+  return Plane ? common->texture_plane1_ : common->texture_;
 }
 
 template <typename tag, typename... Base>
@@ -514,6 +521,17 @@ HRESULT CreateDeviceTexture2D(MTLD3D11Device *pDevice,
                               const D3D11_SUBRESOURCE_DATA *pInitialData,
                               ID3D11Texture2D1 **ppTexture);
 
+HRESULT CreatePlanarDeviceTexture2D(MTLD3D11Device *pDevice,
+                                    const D3D11_TEXTURE2D_DESC1 *pDesc,
+                                    const D3D11_SUBRESOURCE_DATA *pInitialData,
+                                    ID3D11Texture2D1 **ppTexture);
+
+HRESULT CreateMTLTextureDescriptorInternal(
+    MTLD3D11Device *pDevice, D3D11_RESOURCE_DIMENSION Dimension, UINT Width, UINT Height, UINT Depth, UINT ArraySize,
+    UINT SampleCount, UINT BindFlags, UINT CPUAccessFlags, UINT MiscFlags, D3D11_USAGE Usage, UINT MipLevels,
+    DXGI_FORMAT Format, WMTTextureInfo *pDescOut
+);
+
 HRESULT CreateDeviceTexture3D(MTLD3D11Device *pDevice,
                               const D3D11_TEXTURE3D_DESC1 *pDesc,
                               const D3D11_SUBRESOURCE_DATA *pInitialData,
@@ -607,6 +625,15 @@ HRESULT GetLinearTextureLayout(MTLD3D11Device *pDevice,
                                const TEXTURE_DESC &Desc, uint32_t Level,
                                uint32_t &BytesPerRow, uint32_t &BytesPerImage,
                                uint32_t &BytesPerSlice, bool Aligned = true);
+
+/**
+ * Linear layout of a multi-planar texture subresource, matching what D3D11 exposes through Map:
+ * all planes share `BytesPerRow`, plane 1 starts right after the last row of plane 0.
+ */
+HRESULT GetPlanarLinearTextureLayout(
+    MTLD3D11Device *pDevice, const D3D11_TEXTURE2D_DESC1 &Desc, uint32_t &BytesPerRow, uint32_t &Plane1Offset,
+    uint32_t &BytesPerSlice
+);
 
 constexpr void
 CalculateBufferViewOffsetAndSize(const D3D11_BUFFER_DESC &buffer_desc,

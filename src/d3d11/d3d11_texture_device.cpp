@@ -45,9 +45,9 @@ private:
   public:
     TextureSRV(const TextureViewDescriptor &descriptor,
                const tag_shader_resource_view<>::DESC1 *pDesc,
-               DeviceTexture *pResource, MTLD3D11Device *pDevice)
+               DeviceTexture *pResource, Texture *pTexture, MTLD3D11Device *pDevice)
         : SRVBase(pDesc, pResource, pDevice) {
-      this->texture_ = pResource->texture_.ptr();
+      this->texture_ = pTexture;
       this->view_id_ = this->texture_->createView(descriptor);
       this->subset_ = ResourceSubsetState(
         &descriptor,
@@ -64,9 +64,9 @@ private:
   public:
     TextureUAV(const TextureViewDescriptor &descriptor,
                const tag_unordered_access_view<>::DESC1 *pDesc,
-               DeviceTexture *pResource, MTLD3D11Device *pDevice)
+               DeviceTexture *pResource, Texture *pTexture, MTLD3D11Device *pDevice)
         : UAVBase(pDesc, pResource, pDevice) {
-      this->texture_ = pResource->texture_.ptr();
+      this->texture_ = pTexture;
       this->view_id_ = this->texture_->createView(descriptor);
       this->subset_ = ResourceSubsetState(
         &descriptor,
@@ -82,10 +82,11 @@ private:
   public:
     TextureRTV(
         const TextureViewDescriptor &descriptor, WMTPixelFormat view_format, const tag_render_target_view<>::DESC1 *pDesc,
-        DeviceTexture *pResource, MTLD3D11Device *pDevice, const MTL_RENDER_PASS_ATTACHMENT_DESC &mtl_rtv_desc
+        DeviceTexture *pResource, Texture *pTexture, MTLD3D11Device *pDevice,
+        const MTL_RENDER_PASS_ATTACHMENT_DESC &mtl_rtv_desc
     ) :
         RTVBase(pDesc, pResource, pDevice) {
-      this->texture_ = pResource->texture_.ptr();
+      this->texture_ = pTexture;
       this->view_id_ = this->texture_->createView(descriptor);
       this->format_ = view_format;
       this->pass_desc_ = mtl_rtv_desc;
@@ -120,6 +121,53 @@ private:
       );
     }
   };
+
+  /**
+   * Selects the texture a view addresses. For a multi-planar texture the plane is taken from
+   * `PlaneSlice` if non-zero, otherwise from the texel size of the view format (as in D3D11, where
+   * e.g. an R8 view of NV12 addresses luma and an R8G8 view addresses chroma).
+   */
+  template <typename VIEW_DESC>
+  HRESULT
+  ResolveViewPlane(VIEW_DESC &ViewDesc, Texture **ppTexture, UINT **ppPlaneSlice) {
+    *ppPlaneSlice = nullptr;
+    if (!this->texture_plane1_) {
+      *ppTexture = this->texture_.ptr();
+      return S_OK;
+    }
+    if constexpr (std::is_same_v<typename tag_texture::DESC1, D3D11_TEXTURE2D_DESC1>) {
+      MTL_DXGI_PLANAR_FORMAT_DESC planar;
+      if (!MTLQueryDXGIPlanarFormat(this->desc.Format, planar))
+        return E_FAIL;
+      MTL_DXGI_FORMAT_DESC view_format;
+      if (FAILED(MTLQueryDXGIFormat(this->m_parent->GetMTLDevice(), ViewDesc.Format, view_format)))
+        return E_INVALIDARG;
+      UINT *plane_slice = nullptr;
+      static_assert(UINT(D3D11_SRV_DIMENSION_TEXTURE2D) == UINT(D3D11_RTV_DIMENSION_TEXTURE2D));
+      static_assert(UINT(D3D11_SRV_DIMENSION_TEXTURE2D) == UINT(D3D11_UAV_DIMENSION_TEXTURE2D));
+      static_assert(UINT(D3D11_SRV_DIMENSION_TEXTURE2DARRAY) == UINT(D3D11_RTV_DIMENSION_TEXTURE2DARRAY));
+      static_assert(UINT(D3D11_SRV_DIMENSION_TEXTURE2DARRAY) == UINT(D3D11_UAV_DIMENSION_TEXTURE2DARRAY));
+      if (UINT(ViewDesc.ViewDimension) == UINT(D3D11_SRV_DIMENSION_TEXTURE2D))
+        plane_slice = &ViewDesc.Texture2D.PlaneSlice;
+      else if (UINT(ViewDesc.ViewDimension) == UINT(D3D11_SRV_DIMENSION_TEXTURE2DARRAY))
+        plane_slice = &ViewDesc.Texture2DArray.PlaneSlice;
+      else
+        return E_INVALIDARG;
+      uint32_t plane;
+      if (*plane_slice)
+        plane = *plane_slice;
+      else
+        plane = view_format.BytesPerTexel == planar.PlaneBytesPerTexel[1] ? 1 : 0;
+      if (plane >= planar.PlaneCount || view_format.BytesPerTexel != planar.PlaneBytesPerTexel[plane]) {
+        ERR("DeviceTexture: view format ", ViewDesc.Format, " is incompatible with plane ", plane, " of ", this->desc.Format);
+        return E_INVALIDARG;
+      }
+      *ppTexture = plane ? this->texture_plane1_.ptr() : this->texture_.ptr();
+      *ppPlaneSlice = plane_slice;
+      return S_OK;
+    }
+    return E_FAIL;
+  }
 
 public:
   DeviceTexture(const tag_texture::DESC1 *pDesc, Rc<Texture> &&u_texture, MTLD3D11Device *pDevice) :
@@ -183,22 +231,31 @@ public:
     } else {
       arraySize = this->desc.ArraySize;
     }
+    Texture *texture;
+    UINT *plane_slice;
+    if (HRESULT hr = ResolveViewPlane(finalDesc, &texture, &plane_slice); FAILED(hr))
+      return hr;
+    UINT plane = plane_slice ? std::exchange(*plane_slice, 0) : 0;
     MTL_RENDER_PASS_ATTACHMENT_DESC attachment_desc;
     if (FAILED(InitializeAndNormalizeViewDescriptor(
-            this->m_parent, this->desc.MipLevels, arraySize, this->texture_.ptr(), finalDesc,
+            this->m_parent, this->desc.MipLevels, arraySize, texture, finalDesc,
             attachment_desc, descriptor
         ))) {
       return E_FAIL;
     }
+    if (plane_slice)
+      *plane_slice = plane;
     if (!ppView) {
       return S_FALSE;
     }
-    *ppView = ref(new TextureRTV(descriptor, descriptor.format, &finalDesc, this, this->m_parent, attachment_desc));
+    *ppView = ref(new TextureRTV(descriptor, descriptor.format, &finalDesc, this, texture, this->m_parent, attachment_desc));
     return S_OK;
   };
 
   HRESULT STDMETHODCALLTYPE CreateDepthStencilView(const D3D11_DEPTH_STENCIL_VIEW_DESC *pDesc,
                                  ID3D11DepthStencilView **ppView) override {
+    if (this->texture_plane1_)
+      return E_INVALIDARG;
     D3D11_DEPTH_STENCIL_VIEW_DESC finalDesc;
     if (FAILED(ExtractEntireResourceViewDescription(&this->desc, pDesc,
                                                     &finalDesc))) {
@@ -242,16 +299,23 @@ public:
     } else {
       arraySize = this->desc.ArraySize;
     }
+    Texture *texture;
+    UINT *plane_slice;
+    if (HRESULT hr = ResolveViewPlane(finalDesc, &texture, &plane_slice); FAILED(hr))
+      return hr;
+    UINT plane = plane_slice ? std::exchange(*plane_slice, 0) : 0;
     if (FAILED(InitializeAndNormalizeViewDescriptor(
-            this->m_parent, this->desc.MipLevels, arraySize, this->texture_.ptr(), finalDesc, descriptor
+            this->m_parent, this->desc.MipLevels, arraySize, texture, finalDesc, descriptor
         ))) {
       ERR("DeviceTexture: Failed to create texture SRV");
       return E_FAIL;
     }
+    if (plane_slice)
+      *plane_slice = plane;
     if (!ppView) {
       return S_FALSE;
     }
-    *ppView = ref(new TextureSRV(descriptor, &finalDesc, this, this->m_parent));
+    *ppView = ref(new TextureSRV(descriptor, &finalDesc, this, texture, this->m_parent));
     return S_OK;
   };
 
@@ -271,16 +335,23 @@ public:
     } else {
       arraySize = this->desc.ArraySize;
     }
+    Texture *texture;
+    UINT *plane_slice;
+    if (HRESULT hr = ResolveViewPlane(finalDesc, &texture, &plane_slice); FAILED(hr))
+      return hr;
+    UINT plane = plane_slice ? std::exchange(*plane_slice, 0) : 0;
     if (FAILED(InitializeAndNormalizeViewDescriptor(
-            this->m_parent, this->desc.MipLevels, arraySize, this->texture_.ptr(), finalDesc, descriptor
+            this->m_parent, this->desc.MipLevels, arraySize, texture, finalDesc, descriptor
         ))) {
       ERR("DeviceTexture: Failed to create texture UAV");
       return E_FAIL;
     }
+    if (plane_slice)
+      *plane_slice = plane;
     if (!ppView) {
       return S_FALSE;
     }
-    *ppView = ref(new TextureUAV(descriptor, &finalDesc, this, this->m_parent));
+    *ppView = ref(new TextureUAV(descriptor, &finalDesc, this, texture, this->m_parent));
     return S_OK;
   };
 
@@ -493,6 +564,85 @@ CreateDeviceTexture2D(MTLD3D11Device *pDevice,
                       ID3D11Texture2D1 **ppTexture) {
   return CreateDeviceTextureInternal<tag_texture_2d>(pDevice, pDesc,
                                                      pInitialData, ppTexture);
+}
+
+HRESULT
+CreatePlanarDeviceTexture2D(
+    MTLD3D11Device *pDevice, const D3D11_TEXTURE2D_DESC1 *pDesc, const D3D11_SUBRESOURCE_DATA *pInitialData,
+    ID3D11Texture2D1 **ppTexture
+) {
+  MTL_DXGI_PLANAR_FORMAT_DESC planar;
+  if (!MTLQueryDXGIPlanarFormat(pDesc->Format, planar))
+    return E_INVALIDARG;
+  if (pDesc->Width == 0 || pDesc->Height == 0 || pDesc->ArraySize == 0)
+    return E_INVALIDARG;
+  if ((pDesc->Width | pDesc->Height) & 1) {
+    ERR("CreatePlanarDeviceTexture2D: width and height of ", pDesc->Format, " must be even");
+    return E_INVALIDARG;
+  }
+  if (pDesc->MipLevels > 1 || (pDesc->MipLevels == 0 && (pDesc->Width > 1 || pDesc->Height > 1)))
+    return E_INVALIDARG;
+  if (pDesc->SampleDesc.Count != 1)
+    return E_INVALIDARG;
+  if (pDesc->BindFlags & D3D11_BIND_DEPTH_STENCIL)
+    return E_INVALIDARG;
+  if (pDesc->MiscFlags & (D3D11_RESOURCE_MISC_TEXTURECUBE | D3D11_RESOURCE_MISC_GENERATE_MIPS))
+    return E_INVALIDARG;
+  if (pDesc->MiscFlags & (D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE |
+                          D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX)) {
+    ERR("CreatePlanarDeviceTexture2D: shared planar textures are not supported");
+    return E_INVALIDARG;
+  }
+
+  D3D11_TEXTURE2D_DESC1 finalDesc = *pDesc;
+  finalDesc.MipLevels = 1;
+
+  Flags<TextureAllocationFlag> flags;
+  flags.set(finalDesc.CPUAccessFlags ? TextureAllocationFlag::GpuManaged : TextureAllocationFlag::GpuPrivate);
+  if (!(finalDesc.BindFlags & (D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_RENDER_TARGET)))
+    flags.set(TextureAllocationFlag::ShaderReadonly);
+  if (finalDesc.Usage == D3D11_USAGE_IMMUTABLE)
+    flags.set(TextureAllocationFlag::GpuReadonly);
+
+  auto &initializer = pDevice->GetDXMTDevice().queue().initializer;
+
+  Rc<Texture> planes[2];
+  for (unsigned plane = 0; plane < planar.PlaneCount; plane++) {
+    auto shift = planar.PlaneSubsampleShift[plane];
+    WMTTextureInfo info;
+    if (FAILED(CreateMTLTextureDescriptorInternal(
+            pDevice, D3D11_RESOURCE_DIMENSION_TEXTURE2D, finalDesc.Width >> shift, finalDesc.Height >> shift, 1,
+            finalDesc.ArraySize, 1, finalDesc.BindFlags, finalDesc.CPUAccessFlags, finalDesc.MiscFlags,
+            finalDesc.Usage, 1, (DXGI_FORMAT)planar.PlaneFormat[plane], &info
+        )))
+      return E_INVALIDARG;
+    // views may reinterpret the plane (e.g. R8_UINT on the luma plane of NV12)
+    WMTTextureUsage usage = info.usage;
+    usage |= WMTTextureUsagePixelFormatView;
+    info.usage = usage;
+    planes[plane] = new Texture(info, pDevice->GetMTLDevice());
+    planes[plane]->rename(planes[plane]->allocate(flags));
+
+    for (unsigned slice = 0; slice < finalDesc.ArraySize; slice++) {
+      if (!pInitialData) {
+        initializer.initWithZero(planes[plane].ptr(), planes[plane]->current(), slice, 0);
+        continue;
+      }
+      auto &data = pInitialData[slice];
+      // D3D11 initial data of a planar format: plane 1 follows the rows of plane 0 with the same pitch
+      auto plane_data =
+          static_cast<const char *>(data.pSysMem) + (plane ? size_t(data.SysMemPitch) * finalDesc.Height : 0);
+      initializer.initWithData(
+          planes[plane].ptr(), planes[plane]->current(), slice, 0, plane_data, data.SysMemPitch,
+          data.SysMemPitch * (finalDesc.Height >> shift), 0
+      );
+    }
+  }
+
+  auto texture = new DeviceTexture<tag_texture_2d>(&finalDesc, std::move(planes[0]), pDevice);
+  texture->texture_plane1_ = std::move(planes[1]);
+  *ppTexture = reinterpret_cast<ID3D11Texture2D1 *>(ref(texture));
+  return S_OK;
 }
 
 HRESULT
