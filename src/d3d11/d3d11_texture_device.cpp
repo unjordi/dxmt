@@ -430,7 +430,7 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
       ERR("DeviceTexture: Failed to get mach port for shared texture");
       return E_FAIL;
     }
-    SharedResourceData runtimeData;
+    SharedResourceData runtimeData = {};
     MakeUniqueSharedName(runtimeData.mach_port_name);
     if (!WMTBootstrapRegister(runtimeData.mach_port_name, mach_port)) {
       ERR("DeviceTexture: Failed to register mach port for shared texture");
@@ -454,6 +454,8 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
     }
 
     initialize(std::move(allocation));
+    // other devices may write the allocation as soon as the handle exists: complete the initial contents first
+    initializer.wait(initializer.flushToWait());
     *ppTexture = reinterpret_cast<typename tag::COM_IMPL *>(
         ref(new DeviceTexture<tag>(&finalDesc, std::move(texture), local_kmt,
                                    global_kmt, std::move(keyed_mutex), pDevice))
