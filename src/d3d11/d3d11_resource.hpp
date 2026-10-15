@@ -563,6 +563,8 @@ struct SharedResourceData {
     D3D11_TEXTURE3D_DESC1 desc3d;
   } desc;
   D3DKMT_HANDLE mutex_handle;
+  /** Bootstrap name of plane 1 of a multi-planar texture; empty otherwise. */
+  char mach_port_name_plane1[54];
 };
 
 /**

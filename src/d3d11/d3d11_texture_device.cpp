@@ -522,10 +522,13 @@ CreatePlanarDeviceTexture2D(
     return E_INVALIDARG;
   if (pDesc->MiscFlags & (D3D11_RESOURCE_MISC_TEXTURECUBE | D3D11_RESOURCE_MISC_GENERATE_MIPS))
     return E_INVALIDARG;
-  if (pDesc->MiscFlags & (D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE |
-                          D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX)) {
-    ERR("CreatePlanarDeviceTexture2D: shared planar textures are not supported");
+  bool shared = pDesc->MiscFlags & (D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE |
+                                    D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX);
+  if (shared && pDesc->CPUAccessFlags)
     return E_INVALIDARG;
+  if (shared && !(pDevice->GetLocalD3DKMT() & 0xc0000000)) {
+    ERR("CreatePlanarDeviceTexture2D: Invalid device handle");
+    return E_FAIL;
   }
 
   D3D11_TEXTURE2D_DESC1 finalDesc = *pDesc;
@@ -537,6 +540,8 @@ CreatePlanarDeviceTexture2D(
     flags.set(TextureAllocationFlag::ShaderReadonly);
   if (finalDesc.Usage == D3D11_USAGE_IMMUTABLE)
     flags.set(TextureAllocationFlag::GpuReadonly);
+  if (shared)
+    flags.set(TextureAllocationFlag::Shared);
 
   auto &initializer = pDevice->GetDXMTDevice().queue().initializer;
 
@@ -573,10 +578,103 @@ CreatePlanarDeviceTexture2D(
     }
   }
 
-  auto texture = new DeviceTexture<tag_texture_2d>(&finalDesc, std::move(planes[0]), pDevice);
+  if (!shared) {
+    auto texture = new DeviceTexture<tag_texture_2d>(&finalDesc, std::move(planes[0]), pDevice);
+    texture->texture_plane1_ = std::move(planes[1]);
+    *ppTexture = reinterpret_cast<ID3D11Texture2D1 *>(ref(texture));
+    return S_OK;
+  }
+
+  SharedResourceData runtimeData = {};
+  MakeUniqueSharedName(runtimeData.mach_port_name);
+  MakeUniqueSharedName(runtimeData.mach_port_name_plane1);
+  const char *port_names[2] = {runtimeData.mach_port_name, runtimeData.mach_port_name_plane1};
+  for (unsigned plane = 0; plane < planar.PlaneCount; plane++) {
+    mach_port_t mach_port = planes[plane]->current()->machPort;
+    if (!mach_port) {
+      ERR("CreatePlanarDeviceTexture2D: Failed to get mach port for plane ", plane);
+      return E_FAIL;
+    }
+    if (!WMTBootstrapRegister(port_names[plane], mach_port)) {
+      ERR("CreatePlanarDeviceTexture2D: Failed to register mach port for plane ", plane);
+      return E_FAIL;
+    }
+  }
+  runtimeData.dimension = D3D11_RESOURCE_DIMENSION_TEXTURE2D;
+  runtimeData.desc.desc2d = *pDesc;
+
+  Rc<KeyedMutex> keyed_mutex = {};
+  if (finalDesc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX)
+    keyed_mutex = KeyedMutex::create(pDevice->GetMTLDevice());
+  runtimeData.mutex_handle = keyed_mutex ? keyed_mutex->globalHandle() : 0;
+
+  D3DKMT_HANDLE local_kmt, global_kmt;
+  if (FAILED(CreateSharedResourceAllocation(
+          pDevice, runtimeData, finalDesc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE, &local_kmt, &global_kmt
+      ))) {
+    ERR("CreatePlanarDeviceTexture2D: Failed to create D3DKMT for shared texture");
+    return E_FAIL;
+  }
+  // other devices may write the planes as soon as the handle exists: complete the initial contents first
+  initializer.wait(initializer.flushToWait());
+
+  auto texture = new DeviceTexture<tag_texture_2d>(
+      &finalDesc, std::move(planes[0]), local_kmt, global_kmt, std::move(keyed_mutex), pDevice
+  );
   texture->texture_plane1_ = std::move(planes[1]);
   *ppTexture = reinterpret_cast<ID3D11Texture2D1 *>(ref(texture));
   return S_OK;
+}
+
+/**
+ * Opens a multi-planar texture shared by another device: imports one Metal texture per plane, plane 0 from
+ * `MachPort` and plane 1 from the bootstrap name in `RuntimeData`.
+ */
+static HRESULT
+ImportSharedPlanarTexture2D(
+    MTLD3D11Device *pDevice, const SharedResourceData &RuntimeData, mach_port_t MachPort, REFIID riid,
+    void **ppTexture
+) {
+  const D3D11_TEXTURE2D_DESC1 &desc = RuntimeData.desc.desc2d;
+  MTL_DXGI_PLANAR_FORMAT_DESC planar;
+  if (!MTLQueryDXGIPlanarFormat(desc.Format, planar) || planar.PlaneCount != 2)
+    return E_INVALIDARG;
+  mach_port_t ports[2] = {MachPort, 0};
+  if (!WMTBootstrapLookUp(RuntimeData.mach_port_name_plane1, &ports[1])) {
+    ERR("ImportSharedPlanarTexture2D: Failed to look up mach port of plane 1");
+    return E_INVALIDARG;
+  }
+
+  D3D11_TEXTURE2D_DESC1 finalDesc = desc;
+  finalDesc.MipLevels = 1;
+  Rc<Texture> planes[2];
+  for (unsigned plane = 0; plane < 2; plane++) {
+    auto shift = planar.PlaneSubsampleShift[plane];
+    WMTTextureInfo info;
+    if (FAILED(CreateMTLTextureDescriptorInternal(
+            pDevice, D3D11_RESOURCE_DIMENSION_TEXTURE2D, finalDesc.Width >> shift, finalDesc.Height >> shift, 1,
+            finalDesc.ArraySize, 1, finalDesc.BindFlags, finalDesc.CPUAccessFlags, finalDesc.MiscFlags,
+            finalDesc.Usage, 1, (DXGI_FORMAT)planar.PlaneFormat[plane], &info
+        )))
+      return E_INVALIDARG;
+    WMTTextureUsage usage = info.usage;
+    usage |= WMTTextureUsagePixelFormatView;
+    info.usage = usage;
+    planes[plane] = new Texture(info, pDevice->GetMTLDevice());
+    auto allocation = planes[plane]->import(ports[plane]);
+    if (!allocation)
+      return E_FAIL;
+    planes[plane]->rename(std::move(allocation));
+  }
+
+  Rc<KeyedMutex> keyed_mutex;
+  if (RuntimeData.mutex_handle & 0xc0000000)
+    keyed_mutex = KeyedMutex::import(pDevice->GetMTLDevice(), RuntimeData.mutex_handle);
+
+  Com<DeviceTexture<tag_texture_2d>> texture =
+      ref(new DeviceTexture<tag_texture_2d>(&finalDesc, std::move(planes[0]), std::move(keyed_mutex), pDevice));
+  texture->texture_plane1_ = std::move(planes[1]);
+  return texture->QueryInterface(riid, ppTexture);
 }
 
 HRESULT
@@ -675,6 +773,8 @@ ImportSharedTexture(MTLD3D11Device *pDevice, HANDLE hResource, REFIID riid, void
         pDevice, &runtimeData.desc.desc1d, mach_port, runtimeData.mutex_handle, riid, ppTexture
     );
   case D3D11_RESOURCE_DIMENSION_TEXTURE2D:
+    if (runtimeData.mach_port_name_plane1[0])
+      return ImportSharedPlanarTexture2D(pDevice, runtimeData, mach_port, riid, ppTexture);
     return ImportSharedTextureInternal<tag_texture_2d>(
         pDevice, &runtimeData.desc.desc2d, mach_port, runtimeData.mutex_handle, riid, ppTexture
     );
@@ -769,6 +869,8 @@ ImportSharedTextureFromNtHandle(MTLD3D11Device *pDevice, HANDLE hResource, REFII
         pDevice, &runtimeData.desc.desc1d, mach_port, runtimeData.mutex_handle, riid, ppTexture
     );
   case D3D11_RESOURCE_DIMENSION_TEXTURE2D:
+    if (runtimeData.mach_port_name_plane1[0])
+      return ImportSharedPlanarTexture2D(pDevice, runtimeData, mach_port, riid, ppTexture);
     return ImportSharedTextureInternal<tag_texture_2d>(
         pDevice, &runtimeData.desc.desc2d, mach_port, runtimeData.mutex_handle, riid, ppTexture
     );

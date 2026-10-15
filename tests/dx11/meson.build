@@ -35,3 +35,6 @@ executable('dx11_nv12', ['dx11_nv12.cpp'],
 executable('dx11_shared_buffer', ['dx11_shared_buffer.cpp'],
   dependencies: [ lib_d3d11, lib_dxgi ]
 )
+executable('dx11_shared_texture_xproc', ['dx11_shared_texture_xproc.cpp'],
+  dependencies: [ lib_d3d11, lib_dxgi ]
+)
