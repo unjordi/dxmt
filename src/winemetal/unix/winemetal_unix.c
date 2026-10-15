@@ -9,6 +9,7 @@
 #include "objc/objc-runtime.h"
 #include <bootstrap.h>
 #include <mach/mach_port.h>
+#include <mach/mach_vm.h>
 #define WINEMETAL_API
 #include "../winemetal_thunks.h"
 #include "../airconv_thunks.h"
@@ -2733,6 +2734,71 @@ _MTLDevice_newSharedTexture(void *obj) {
   return STATUS_SUCCESS;
 }
 
+static NTSTATUS
+_MTLDevice_newSharedBuffer(void *obj) {
+  struct unixcall_mtldevice_newsharedbuffer *params = obj;
+  id<MTLDevice> device = (id<MTLDevice>)params->device;
+  struct WMTBufferInfo *info = params->info.ptr;
+  mach_port_t entry = params->mach_port;
+  bool import = entry != MACH_PORT_NULL;
+  /* multiple of both the 4K (Rosetta) and 16K (arm64) page sizes */
+  const mach_vm_size_t page = 16384;
+  mach_vm_size_t size = (info->length + page - 1) & ~(page - 1);
+  kern_return_t kr;
+
+  params->ret = 0;
+  if (!size)
+    return STATUS_UNSUCCESSFUL;
+
+  if (!import) {
+    memory_object_size_t entry_size = size;
+    kr = mach_make_memory_entry_64(
+        mach_task_self(), &entry_size, 0, MAP_MEM_NAMED_CREATE | VM_PROT_READ | VM_PROT_WRITE, &entry, MACH_PORT_NULL
+    );
+    if (kr != KERN_SUCCESS)
+      return STATUS_UNSUCCESSFUL;
+    size = entry_size;
+  }
+
+  mach_vm_address_t address = 0;
+  kr = mach_vm_map(
+      mach_task_self(), &address, size, page - 1, VM_FLAGS_ANYWHERE, entry, 0, false, VM_PROT_READ | VM_PROT_WRITE,
+      VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE
+  );
+  if (kr != KERN_SUCCESS) {
+    if (!import)
+      mach_port_deallocate(mach_task_self(), entry);
+    return STATUS_UNSUCCESSFUL;
+  }
+
+  /* the creator keeps its send right alive as long as the buffer; the importer only needs the mapping */
+  mach_port_t owned_entry = import ? MACH_PORT_NULL : entry;
+  if (import)
+    mach_port_deallocate(mach_task_self(), entry);
+
+  id<MTLBuffer> buffer = [device newBufferWithBytesNoCopy:(void *)address
+                                                   length:size
+                                                  options:(enum MTLResourceOptions)info->options
+                                              deallocator:^(void *pointer, NSUInteger length) {
+                                                mach_vm_deallocate(mach_task_self(), (mach_vm_address_t)pointer, length);
+                                                if (owned_entry != MACH_PORT_NULL)
+                                                  mach_port_deallocate(mach_task_self(), owned_entry);
+                                              }];
+  if (!buffer) {
+    mach_vm_deallocate(mach_task_self(), address, size);
+    if (owned_entry != MACH_PORT_NULL)
+      mach_port_deallocate(mach_task_self(), owned_entry);
+    return STATUS_UNSUCCESSFUL;
+  }
+
+  info->length = size;
+  info->memory.ptr = (void *)address;
+  info->gpu_address = [buffer gpuAddress];
+  params->mach_port = owned_entry;
+  params->ret = (obj_handle_t)buffer;
+  return STATUS_SUCCESS;
+}
+
 /* Private API to register a mach port with the bootstrap server */
 extern kern_return_t bootstrap_register2(mach_port_t bp, name_t service_name, mach_port_t sp, int flags);
 
@@ -3310,6 +3376,7 @@ const void *__wine_unix_call_funcs[] = {
     &_MTLDevice_newIndirectCommandBuffer,
     &_MTLDevice_newLibraryWithSource,
     &_MTLTexture_getBytes,
+    &_MTLDevice_newSharedBuffer,
 };
 
 #ifndef DXMT_NATIVE
@@ -3460,5 +3527,6 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_MTLDevice_newIndirectCommandBuffer,
     &_MTLDevice_newLibraryWithSource,
     &_MTLTexture_getBytes,
+    &_MTLDevice_newSharedBuffer,
 };
 #endif

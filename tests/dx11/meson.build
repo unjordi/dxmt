@@ -32,3 +32,6 @@ executable('dx11_hdr_pq', ['dx11_hdr_pq.cpp'],
 executable('dx11_nv12', ['dx11_nv12.cpp'],
   dependencies: [ lib_d3d11, lib_dxgi ]
 )
+executable('dx11_shared_buffer', ['dx11_shared_buffer.cpp'],
+  dependencies: [ lib_d3d11, lib_dxgi ]
+)

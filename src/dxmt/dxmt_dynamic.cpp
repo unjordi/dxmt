@@ -2,9 +2,10 @@
 #include "dxmt_texture.hpp"
 
 namespace dxmt {
-DynamicBuffer::DynamicBuffer(Buffer *buffer, Flags<BufferAllocationFlag> flags) :
+DynamicBuffer::DynamicBuffer(Buffer *buffer, Flags<BufferAllocationFlag> flags, bool pinned) :
     buffer(buffer),
     flags_(flags),
+    pinned_(pinned),
     name_(buffer->current()) {}
 
 void

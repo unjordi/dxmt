@@ -350,6 +350,14 @@ struct unixcall_bootstrap {
   uint32_t reserved;
 };
 
+struct unixcall_mtldevice_newsharedbuffer {
+  obj_handle_t device;
+  struct WMTMemoryPointer info;
+  uint32_t mach_port;
+  uint32_t reserved;
+  obj_handle_t ret;
+};
+
 struct unixcall_mtlsharedevent_waituntilsignaledvalue {
   obj_handle_t event;
   uint64_t value;

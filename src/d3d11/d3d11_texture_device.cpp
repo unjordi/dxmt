@@ -357,72 +357,18 @@ public:
 
   virtual HRESULT
   GetSharedHandle(HANDLE *pSharedHandle) override {
-    if (pSharedHandle == nullptr || (this->desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE)) {
-      return E_INVALIDARG;
-    }
-
-    if (!(this->desc.MiscFlags & (D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX))) {
-      *pSharedHandle = NULL;
-      return S_OK;
-    }
-
-    if (!global_kmt_) {
-      return E_INVALIDARG;
-    }
-
-    *pSharedHandle = reinterpret_cast<HANDLE>(global_kmt_);
-    return S_OK;
+    return GetSharedResourceHandle(this->desc.MiscFlags, global_kmt_, pSharedHandle);
   }
 
   virtual HRESULT
   CreateSharedHandle(const SECURITY_ATTRIBUTES *Attributes, DWORD Access, const WCHAR *pName, HANDLE *pNTHandle)
       override {
-    InitReturnPtr(pNTHandle);
-    if (!local_kmt_)
-      return E_INVALIDARG;
-
-    OBJECT_ATTRIBUTES attr = {};
-    attr.Length = sizeof(attr);
-    attr.SecurityDescriptor = const_cast<SECURITY_ATTRIBUTES*>(Attributes);
-
-    WCHAR buffer[MAX_PATH];
-    UNICODE_STRING name_str;
-    if (pName) {
-      DWORD session, len, name_len = wcslen(pName);
-
-      ProcessIdToSessionId(GetCurrentProcessId(), &session);
-      len = swprintf(buffer, ARRAYSIZE(buffer), L"\\Sessions\\%u\\BaseNamedObjects\\", session);
-      memcpy(buffer + len, pName, (name_len + 1) * sizeof(WCHAR));
-      name_str.MaximumLength = name_str.Length = (len + name_len) * sizeof(WCHAR);
-      name_str.MaximumLength += sizeof(WCHAR);
-      name_str.Buffer = buffer;
-
-      attr.ObjectName = &name_str;
-      attr.Attributes = OBJ_CASE_INSENSITIVE;
-    }
-
-    if (D3DKMTShareObjects(1, &local_kmt_, &attr, Access, pNTHandle)) {
-      ERR("DeviceTexture: Failed to create shared handle");
-      return E_FAIL;
-    }
-
-    return S_OK;
+    return CreateSharedResourceNtHandle(local_kmt_, Attributes, Access, pName, pNTHandle);
   }
 
   void SetMinLOD(float MinLod) override { min_lod = MinLod; }
 
   float GetMinLOD() override { return min_lod; }
-};
-
-struct SharedResourceData {
-  char mach_port_name[54];
-  D3D11_RESOURCE_DIMENSION dimension;
-  union {
-    D3D11_TEXTURE1D_DESC desc1d;
-    D3D11_TEXTURE2D_DESC1 desc2d;
-    D3D11_TEXTURE3D_DESC1 desc3d;
-  } desc;
-  D3DKMT_HANDLE mutex_handle;
 };
 
 template <typename tag>
@@ -499,32 +445,18 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
     }
     runtimeData.mutex_handle = keyed_mutex ? keyed_mutex->globalHandle() : 0;
 
-    D3DKMT_CREATEALLOCATION create = {};
-    create.hDevice = pDevice->GetLocalD3DKMT();
-    create.pPrivateRuntimeData = &runtimeData;
-    create.PrivateRuntimeDataSize = sizeof(runtimeData);
-    create.Flags.StandardAllocation = 1;
-    create.NumAllocations = 1;
-    D3DDDI_ALLOCATIONINFO2 allocationInfo = {};
-    create.pAllocationInfo2 = &allocationInfo;
-    D3DKMT_CREATESTANDARDALLOCATION standardAllocation = {};
-    create.pStandardAllocation = &standardAllocation;
-    standardAllocation.Type = D3DKMT_STANDARDALLOCATIONTYPE_EXISTINGHEAP;
-    create.Flags.ExistingSysMem = 1;
-    D3DDDI_ALLOCATIONINFO systemMem;
-    allocationInfo.pSystemMem = &systemMem;
-    create.Flags.CreateResource = 1;
-    create.Flags.CreateShared = 1;
-    create.Flags.NtSecuritySharing = !!(finalDesc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE);
-    if (D3DKMTCreateAllocation2(&create)) {
+    D3DKMT_HANDLE local_kmt, global_kmt;
+    if (FAILED(CreateSharedResourceAllocation(
+            pDevice, runtimeData, finalDesc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE, &local_kmt, &global_kmt
+        ))) {
       ERR("DeviceTexture: Failed to create D3DKMT for shared texture");
       return E_FAIL;
     }
 
     initialize(std::move(allocation));
     *ppTexture = reinterpret_cast<typename tag::COM_IMPL *>(
-        ref(new DeviceTexture<tag>(&finalDesc, std::move(texture), create.hResource,
-                                   create.hGlobalShare, std::move(keyed_mutex), pDevice))
+        ref(new DeviceTexture<tag>(&finalDesc, std::move(texture), local_kmt,
+                                   global_kmt, std::move(keyed_mutex), pDevice))
     );
     return S_OK;
   }
@@ -748,6 +680,8 @@ ImportSharedTexture(MTLD3D11Device *pDevice, HANDLE hResource, REFIID riid, void
     return ImportSharedTextureInternal<tag_texture_3d>(
         pDevice, &runtimeData.desc.desc3d, mach_port, runtimeData.mutex_handle, riid, ppTexture
     );
+  case D3D11_RESOURCE_DIMENSION_BUFFER:
+    return ImportSharedBuffer(pDevice, &runtimeData.desc.buffer, mach_port, runtimeData.mutex_handle, riid, ppTexture);
   default:
     ERR("ImportSharedTexture: Unsupported resource dimension");
     return E_INVALIDARG;
@@ -840,6 +774,8 @@ ImportSharedTextureFromNtHandle(MTLD3D11Device *pDevice, HANDLE hResource, REFII
     return ImportSharedTextureInternal<tag_texture_3d>(
         pDevice, &runtimeData.desc.desc3d, mach_port, runtimeData.mutex_handle, riid, ppTexture
     );
+  case D3D11_RESOURCE_DIMENSION_BUFFER:
+    return ImportSharedBuffer(pDevice, &runtimeData.desc.buffer, mach_port, runtimeData.mutex_handle, riid, ppTexture);
   default:
     ERR("ImportSharedTexture: Unsupported resource dimension");
     return E_INVALIDARG;
@@ -879,6 +815,91 @@ ImportSharedTextureByName(
   HRESULT res = ImportSharedTextureFromNtHandle(pDevice, openFromName.hNtHandle, riid, ppTexture);
   CloseHandle(openFromName.hNtHandle);
   return res;
+}
+
+HRESULT
+CreateSharedResourceAllocation(
+    MTLD3D11Device *pDevice, SharedResourceData &RuntimeData, bool NtHandle, D3DKMT_HANDLE *pLocal,
+    D3DKMT_HANDLE *pGlobal
+) {
+  D3DKMT_CREATEALLOCATION create = {};
+  create.hDevice = pDevice->GetLocalD3DKMT();
+  create.pPrivateRuntimeData = &RuntimeData;
+  create.PrivateRuntimeDataSize = sizeof(RuntimeData);
+  create.Flags.StandardAllocation = 1;
+  create.NumAllocations = 1;
+  D3DDDI_ALLOCATIONINFO2 allocationInfo = {};
+  create.pAllocationInfo2 = &allocationInfo;
+  D3DKMT_CREATESTANDARDALLOCATION standardAllocation = {};
+  create.pStandardAllocation = &standardAllocation;
+  standardAllocation.Type = D3DKMT_STANDARDALLOCATIONTYPE_EXISTINGHEAP;
+  create.Flags.ExistingSysMem = 1;
+  D3DDDI_ALLOCATIONINFO systemMem;
+  allocationInfo.pSystemMem = &systemMem;
+  create.Flags.CreateResource = 1;
+  create.Flags.CreateShared = 1;
+  create.Flags.NtSecuritySharing = NtHandle;
+  if (D3DKMTCreateAllocation2(&create))
+    return E_FAIL;
+  *pLocal = create.hResource;
+  *pGlobal = create.hGlobalShare;
+  return S_OK;
+}
+
+HRESULT
+GetSharedResourceHandle(UINT MiscFlags, D3DKMT_HANDLE GlobalHandle, HANDLE *pSharedHandle) {
+  if (pSharedHandle == nullptr || (MiscFlags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE)) {
+    return E_INVALIDARG;
+  }
+
+  if (!(MiscFlags & (D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX))) {
+    *pSharedHandle = NULL;
+    return S_OK;
+  }
+
+  if (!GlobalHandle) {
+    return E_INVALIDARG;
+  }
+
+  *pSharedHandle = reinterpret_cast<HANDLE>(GlobalHandle);
+  return S_OK;
+}
+
+HRESULT
+CreateSharedResourceNtHandle(
+    D3DKMT_HANDLE LocalHandle, const SECURITY_ATTRIBUTES *Attributes, DWORD Access, const WCHAR *pName,
+    HANDLE *pNTHandle
+) {
+  InitReturnPtr(pNTHandle);
+  if (!LocalHandle)
+    return E_INVALIDARG;
+
+  OBJECT_ATTRIBUTES attr = {};
+  attr.Length = sizeof(attr);
+  attr.SecurityDescriptor = const_cast<SECURITY_ATTRIBUTES*>(Attributes);
+
+  WCHAR buffer[MAX_PATH];
+  UNICODE_STRING name_str;
+  if (pName) {
+    DWORD session, len, name_len = wcslen(pName);
+
+    ProcessIdToSessionId(GetCurrentProcessId(), &session);
+    len = swprintf(buffer, ARRAYSIZE(buffer), L"\\Sessions\\%u\\BaseNamedObjects\\", session);
+    memcpy(buffer + len, pName, (name_len + 1) * sizeof(WCHAR));
+    name_str.MaximumLength = name_str.Length = (len + name_len) * sizeof(WCHAR);
+    name_str.MaximumLength += sizeof(WCHAR);
+    name_str.Buffer = buffer;
+
+    attr.ObjectName = &name_str;
+    attr.Attributes = OBJ_CASE_INSENSITIVE;
+  }
+
+  if (D3DKMTShareObjects(1, &LocalHandle, &attr, Access, pNTHandle)) {
+    ERR("CreateSharedHandle: Failed to create shared handle");
+    return E_FAIL;
+  }
+
+  return S_OK;
 }
 
 #pragma endregion

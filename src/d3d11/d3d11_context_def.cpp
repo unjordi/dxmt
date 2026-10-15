@@ -160,6 +160,10 @@ public:
       case D3D11_MAP_READ_WRITE:
         return E_INVALIDARG;
       case D3D11_MAP_WRITE_DISCARD: {
+        if (dynamic->pinned()) {
+          ERR("DeferredContext: WRITE_DISCARD map of a shared dynamic buffer is not supported on a deferred context");
+          return E_INVALIDARG;
+        }
         if (bind_flag & D3D11_BIND_VERTEX_BUFFER) {
           state_.InputAssembler.VertexBuffers.set_dirty();
         }

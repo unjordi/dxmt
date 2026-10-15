@@ -30,7 +30,16 @@ public:
     return name_->mappedMemory(name_suballocation_);
   }
 
-  DynamicBuffer(Buffer *buffer, Flags<BufferAllocationFlag> flags);
+  DynamicBuffer(Buffer *buffer, Flags<BufferAllocationFlag> flags, bool pinned = false);
+
+  /**
+   * A pinned buffer must never be renamed: its allocation is visible outside of this device (e.g. shared
+   * with another process). A discarding map has to wait until the GPU no longer uses the allocation.
+   */
+  bool
+  pinned() const {
+    return pinned_;
+  }
 
   struct QueueEntry {
     Rc<BufferAllocation> allocation;
@@ -44,6 +53,7 @@ public:
 
 private:
   Flags<BufferAllocationFlag> flags_;
+  bool pinned_;
   std::atomic<uint32_t> refcount_ = {0u};
   std::queue<QueueEntry> fifo;
   dxmt::mutex mutex_;

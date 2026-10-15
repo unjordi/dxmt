@@ -1331,3 +1331,18 @@ MTLTexture_getBytes(
   params.bytes_per_image = bytes_per_image;
   UNIX_CALL(145, &params);
 }
+
+WINEMETAL_API obj_handle_t
+MTLDevice_newSharedBuffer(obj_handle_t device, struct WMTBufferInfo *info, mach_port_t *mach_port) {
+  struct unixcall_mtldevice_newsharedbuffer params;
+  params.device = device;
+  WMT_MEMPTR_SET(params.info, info);
+  params.mach_port = *mach_port;
+  params.reserved = 0;
+  params.ret = 0;
+  NTSTATUS status = WINE_UNIX_CALL(146, &params);
+  if (status)
+    return 0;
+  *mach_port = params.mach_port;
+  return params.ret;
+}

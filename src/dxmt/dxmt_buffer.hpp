@@ -41,6 +41,8 @@ enum class BufferAllocationFlag : uint32_t {
   SuballocateFromOnePage = 5,
   CpuPlaced = 6,
   AllocatedOnHeap = 7,
+  /* backed by memory that can be mapped in other processes; see Buffer::allocateShared */
+  Shared = 8,
 };
 
 struct BufferViewKey {
@@ -152,6 +154,9 @@ private:
       WMT::Device device, const WMTBufferInfo &info, Flags<BufferAllocationFlag> flags, WMT::Heap heap,
       uint64_t heap_offset
   );
+  BufferAllocation(
+      WMT::Device device, const WMTBufferInfo &info, Flags<BufferAllocationFlag> flags, mach_port_t &mach_port
+  );
   void free();
 
   BufferAllocation(const BufferAllocation &) = delete;
@@ -185,6 +190,17 @@ public:
 
   Rc<BufferAllocation> allocate(Flags<BufferAllocationFlag> flags);
   Rc<BufferAllocation> allocate(Flags<BufferAllocationFlag> flags, WMT::Heap heap, uint64_t heap_offset);
+
+  /**
+   * Allocates memory that other processes can map. On success `mach_port` receives a send right to the
+   * memory entry, owned by the allocation. Returns null on failure.
+   */
+  Rc<BufferAllocation> allocateShared(Flags<BufferAllocationFlag> flags, mach_port_t &mach_port);
+  /**
+   * Maps the memory entry `mach_port` created by `allocateShared` (possibly in another process).
+   * The send right is consumed. Returns null on failure.
+   */
+  Rc<BufferAllocation> importShared(Flags<BufferAllocationFlag> flags, mach_port_t mach_port);
 
   Rc<BufferAllocation> rename(Rc<BufferAllocation> &&newAllocation);
 

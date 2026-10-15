@@ -988,6 +988,11 @@ public:
     return Reference<Texture>(MTLDevice_newSharedTexture(handle, &info));
   }
 
+  Reference<Buffer>
+  newSharedBuffer(WMTBufferInfo &info, mach_port_t &mach_port) {
+    return Reference<Buffer>(MTLDevice_newSharedBuffer(handle, &info, &mach_port));
+  }
+
   Reference<CounterSampleBuffer>
   newCounterSampleBuffer(uint32_t sample_count, bool shared = true) {
     return Reference<CounterSampleBuffer>(MTLCounterSampleBuffer_newTimestampBuffer(handle, sample_count, shared));

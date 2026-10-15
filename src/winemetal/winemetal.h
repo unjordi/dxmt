@@ -1992,6 +1992,17 @@ WINEMETAL_API bool WMTSetMetalShaderCachePath(const char *path);
 
 WINEMETAL_API obj_handle_t MTLDevice_newSharedTexture(obj_handle_t device, struct WMTTextureInfo *info);
 
+/**
+ * Creates a buffer backed by memory that can be mapped by other processes.
+ *
+ * If `*mach_port` is 0, new memory of at least `info->length` bytes is allocated and `*mach_port` receives a send
+ * right to its memory entry. Otherwise the memory entry named by `*mach_port` is mapped; the caller's send right is
+ * consumed. `info->length` is rounded up to the page size; `info->memory` and `info->gpu_address` are outputs.
+ * Returns 0 on failure.
+ */
+WINEMETAL_API obj_handle_t
+MTLDevice_newSharedBuffer(obj_handle_t device, struct WMTBufferInfo *info, mach_port_t *mach_port);
+
 WINEMETAL_API bool WMTBootstrapRegister(const char *name, mach_port_t mach_port);
 
 WINEMETAL_API bool WMTBootstrapLookUp(const char *name, mach_port_t *mach_port);

@@ -92,6 +92,11 @@ public:
       case D3D11_USAGE_DYNAMIC:
         return dxmt::CreateBuffer(this, pDesc, pInitialData, ppBuffer);
       case D3D11_USAGE_STAGING:
+        if (pDesc->MiscFlags & (D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE |
+                                D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX)) {
+          ERR("CreateBuffer: shared staging buffer is not supported");
+          return E_INVALIDARG;
+        }
         return CreateStagingBuffer(this, pDesc, pInitialData, ppBuffer);
       default:
         DXMT_UNREACHABLE

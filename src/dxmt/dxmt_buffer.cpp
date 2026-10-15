@@ -70,6 +70,22 @@ BufferAllocation::BufferAllocation(
   mappedMemory_ = info_.memory.get_accessible_or_null();
 }
 
+BufferAllocation::BufferAllocation(
+    WMT::Device device, const WMTBufferInfo &info, Flags<BufferAllocationFlag> flags, mach_port_t &mach_port
+) :
+    info_(info),
+    flags_(flags) {
+  assert(!flags_.test(BufferAllocationFlag::SuballocateFromOnePage) && "shared buffer doesn't support suballocation");
+  assert(!flags_.test(BufferAllocationFlag::CpuPlaced) && "shared buffer doesn't support placed buffer");
+  info_.length = std::max(info_.length, 256ull);
+  suballocation_size_ = info_.length;
+  fenceTrackers.resize(suballocation_count_);
+  info_.memory.set(0);
+  obj_ = device.newSharedBuffer(info_, mach_port);
+  gpuAddress_ = info_.gpu_address;
+  mappedMemory_ = obj_ ? info_.memory.get_accessible_or_null() : nullptr;
+}
+
 void
 BufferAllocation::free() {
   if (placed_buffer) {
@@ -136,7 +152,8 @@ Buffer::prepareAllocationViews(BufferAllocation *allocation) {
     info.options = allocation->info_.options;
     auto usage = WMTTextureUsageShaderRead;
     if (!allocation->flags().test(BufferAllocationFlag::GpuReadonly) &&
-       ( allocation->flags().test(BufferAllocationFlag::GpuManaged) ||  allocation->flags().test(BufferAllocationFlag::GpuPrivate))) {
+       ( allocation->flags().test(BufferAllocationFlag::GpuManaged) ||  allocation->flags().test(BufferAllocationFlag::GpuPrivate) ||
+         allocation->flags().test(BufferAllocationFlag::Shared))) {
       usage |= WMTTextureUsageShaderWrite;
       if (format == WMTPixelFormatR32Uint || format == WMTPixelFormatR32Sint ||
           (format == WMTPixelFormatRG32Uint && device_.supportsFamily(WMTGPUFamilyApple8))) {
@@ -186,6 +203,33 @@ Buffer::allocate(Flags<BufferAllocationFlag> flags) {
   info.options = options;
   return new BufferAllocation(device_, info, flags);
 };
+
+Rc<BufferAllocation>
+Buffer::allocateShared(Flags<BufferAllocationFlag> flags, mach_port_t &mach_port) {
+  flags.set(BufferAllocationFlag::Shared);
+  WMTBufferInfo info;
+  info.memory.set(0);
+  info.length = length_;
+  info.options = WMTResourceHazardTrackingModeUntracked;
+  mach_port = 0;
+  Rc<BufferAllocation> allocation = new BufferAllocation(device_, info, flags, mach_port);
+  if (!allocation->buffer())
+    return nullptr;
+  return allocation;
+}
+
+Rc<BufferAllocation>
+Buffer::importShared(Flags<BufferAllocationFlag> flags, mach_port_t mach_port) {
+  flags.set(BufferAllocationFlag::Shared);
+  WMTBufferInfo info;
+  info.memory.set(0);
+  info.length = length_;
+  info.options = WMTResourceHazardTrackingModeUntracked;
+  Rc<BufferAllocation> allocation = new BufferAllocation(device_, info, flags, mach_port);
+  if (!allocation->buffer())
+    return nullptr;
+  return allocation;
+}
 
 Rc<BufferAllocation>
 Buffer::allocate(Flags<BufferAllocationFlag> flags, WMT::Heap heap, uint64_t heap_offset) {

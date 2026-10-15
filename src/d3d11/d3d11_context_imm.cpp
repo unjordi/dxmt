@@ -133,6 +133,27 @@ public:
     return dynamic->immediateMappedMemory();
   }
 
+  /**
+   * A pinned dynamic buffer is mapped in place, so a discarding map waits until all submitted GPU work
+   * (which may read the previous contents) has completed.
+   */
+  HRESULT
+  WaitPinnedDynamicBufferIdle(UINT MapFlags) {
+    Flush();
+    auto last_committed_seq_id = cmd_queue.CurrentSeqId() - 1;
+    if (cmd_queue.CoherentSeqId() >= last_committed_seq_id)
+      return S_OK;
+    if ((MapFlags & D3D11_MAP_FLAG_DO_NOT_WAIT) && !ignore_map_flag_no_wait_)
+      return DXGI_ERROR_WAS_STILL_DRAWING;
+    auto &statistics = cmd_queue.CurrentFrameStatistics();
+    auto t0 = clock::now();
+    cmd_queue.WaitCPUFence(last_committed_seq_id);
+    auto t1 = clock::now();
+    statistics.sync_count++;
+    statistics.sync_interval += (t1 - t0);
+    return S_OK;
+  }
+
   HRESULT
   STDMETHODCALLTYPE
   Map(ID3D11Resource *pResource, UINT Subresource, D3D11_MAP MapType, UINT MapFlags,
@@ -154,6 +175,14 @@ public:
       case D3D11_MAP_READ_WRITE:
         return E_INVALIDARG;
       case D3D11_MAP_WRITE_DISCARD: {
+        if (dynamic->pinned()) {
+          if (HRESULT hr = WaitPinnedDynamicBufferIdle(MapFlags); FAILED(hr))
+            return hr;
+          pMappedResource->pData = dynamic->immediateMappedMemory();
+          pMappedResource->RowPitch = buffer_length;
+          pMappedResource->DepthPitch = buffer_length;
+          break;
+        }
         if (bind_flag & D3D11_BIND_VERTEX_BUFFER) {
           state_.InputAssembler.VertexBuffers.set_dirty();
         }

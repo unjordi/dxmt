@@ -550,6 +550,45 @@ CreateBuffer(MTLD3D11Device *pDevice, const D3D11_BUFFER_DESC *pDesc,
                     const D3D11_SUBRESOURCE_DATA *pInitialData,
                     ID3D11Buffer **ppBuffer);
 
+/**
+ * Private runtime data of a shared resource's D3DKMT allocation. The layout is read by other processes.
+ */
+struct SharedResourceData {
+  char mach_port_name[54];
+  D3D11_RESOURCE_DIMENSION dimension;
+  union {
+    D3D11_BUFFER_DESC buffer;
+    D3D11_TEXTURE1D_DESC desc1d;
+    D3D11_TEXTURE2D_DESC1 desc2d;
+    D3D11_TEXTURE3D_DESC1 desc3d;
+  } desc;
+  D3DKMT_HANDLE mutex_handle;
+};
+
+/**
+ * Creates the shared D3DKMT allocation that carries `RuntimeData`. `pGlobal` receives the KMT handle (0 if
+ * `NtHandle`); `pLocal` the handle to destroy with D3DKMTDestroyAllocation.
+ */
+HRESULT CreateSharedResourceAllocation(
+    MTLD3D11Device *pDevice, SharedResourceData &RuntimeData, bool NtHandle, D3DKMT_HANDLE *pLocal,
+    D3DKMT_HANDLE *pGlobal
+);
+
+/** IDXGIResource::GetSharedHandle of a resource created with `MiscFlags`. */
+HRESULT GetSharedResourceHandle(UINT MiscFlags, D3DKMT_HANDLE GlobalHandle, HANDLE *pSharedHandle);
+
+/** IDXGIResource1::CreateSharedHandle of the shared allocation `LocalHandle`. */
+HRESULT CreateSharedResourceNtHandle(
+    D3DKMT_HANDLE LocalHandle, const SECURITY_ATTRIBUTES *Attributes, DWORD Access, const WCHAR *pName,
+    HANDLE *pNTHandle
+);
+
+/** Opens a buffer shared by `CreateBuffer` (possibly in another process) from its memory entry `MachPort`. */
+HRESULT ImportSharedBuffer(
+    MTLD3D11Device *pDevice, const D3D11_BUFFER_DESC *pDesc, mach_port_t MachPort, D3DKMT_HANDLE hSharedKeyedMutex,
+    REFIID riid, void **ppBuffer
+);
+
 HRESULT CreateDynamicLinearTexture1D(MTLD3D11Device *pDevice,
                                const D3D11_TEXTURE1D_DESC *pDesc,
                                const D3D11_SUBRESOURCE_DATA *pInitialData,

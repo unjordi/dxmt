@@ -1229,14 +1229,16 @@ public:
       if (auto dynamic = GetDynamicBuffer(pDstResource, &buffer_len, &unused_bind_flag)) {
         D3D11_MAPPED_SUBRESOURCE mapped;
         if ((CopyFlags & D3D11_COPY_DISCARD) || (copy_len == buffer_len && copy_offset == 0)) {
-          Map(pDstResource, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+          if (FAILED(Map(pDstResource, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+            return;
           auto [allocation, sub] = GetDynamicBufferAllocation(dynamic);
           allocation->updateContents(copy_offset, pSrcData, copy_len, sub);
           Unmap(pDstResource, 0);
           return;
         }
         if (CopyFlags & D3D11_COPY_NO_OVERWRITE) {
-          Map(pDstResource, 0, D3D11_MAP_WRITE_NO_OVERWRITE, 0, &mapped);
+          if (FAILED(Map(pDstResource, 0, D3D11_MAP_WRITE_NO_OVERWRITE, 0, &mapped)))
+            return;
           auto [allocation, sub] = GetDynamicBufferAllocation(dynamic);
           allocation->updateContents(copy_offset, pSrcData, copy_len, sub);
           Unmap(pDstResource, 0);

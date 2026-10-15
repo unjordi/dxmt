@@ -40,6 +40,8 @@ private:
 #endif
   bool structured;
   bool allow_raw_view;
+  D3DKMT_HANDLE local_kmt_ = 0;
+  D3DKMT_HANDLE global_kmt_ = 0;
 
   Rc<DynamicBuffer> dynamic_;
 
@@ -118,6 +120,35 @@ public:
     }
   }
 
+  /**
+   * Wraps a buffer whose current allocation is shared with other processes. The allocation is never renamed:
+   * a DYNAMIC buffer gets a pinned DynamicBuffer, a DEFAULT buffer is updated by GPU copies only.
+   */
+  D3D11Buffer(
+      const tag_buffer::DESC1 *pDesc, Rc<Buffer> &&buffer, Flags<BufferAllocationFlag> flags, D3DKMT_HANDLE localHandle,
+      D3DKMT_HANDLE globalHandle, Rc<KeyedMutex> &&keyed_mutex, MTLD3D11Device *device
+  ) :
+      TResourceBase<tag_buffer>(*pDesc, device),
+      local_kmt_(localHandle),
+      global_kmt_(globalHandle) {
+    buffer_ = std::move(buffer);
+    keyed_mutex_ = std::move(keyed_mutex);
+    structured = pDesc->MiscFlags & D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+    allow_raw_view = pDesc->MiscFlags & D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+    if (pDesc->Usage == D3D11_USAGE_DYNAMIC) {
+      dynamic_ = new DynamicBuffer(buffer_.ptr(), flags, true);
+    }
+  }
+
+  ~D3D11Buffer() {
+    if (local_kmt_) {
+      D3DKMT_DESTROYALLOCATION destroy = {};
+      destroy.hDevice = m_parent->GetLocalD3DKMT();
+      destroy.hResource = local_kmt_;
+      D3DKMTDestroyAllocation(&destroy);
+    }
+  }
+
   HRESULT
   STDMETHODCALLTYPE
   QueryInterface(REFIID riid, void **ppvObject) override {
@@ -125,6 +156,17 @@ public:
       return E_POINTER;
 
     return TResourceBase<tag_buffer>::QueryInterface(riid, ppvObject);
+  }
+
+  HRESULT
+  GetSharedHandle(HANDLE *pSharedHandle) override {
+    return GetSharedResourceHandle(desc.MiscFlags, global_kmt_, pSharedHandle);
+  }
+
+  HRESULT
+  CreateSharedHandle(const SECURITY_ATTRIBUTES *Attributes, DWORD Access, const WCHAR *pName, HANDLE *pNTHandle)
+      override {
+    return CreateSharedResourceNtHandle(local_kmt_, Attributes, Access, pName, pNTHandle);
   }
 
   Rc<StagingResource>
@@ -309,11 +351,132 @@ public:
   }
 };
 
+constexpr UINT kSharedResourceMiscFlags =
+    D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
+
+static Flags<BufferAllocationFlag>
+SharedBufferAllocationFlags(const D3D11_BUFFER_DESC *pDesc) {
+  Flags<BufferAllocationFlag> flags;
+  if (pDesc->Usage == D3D11_USAGE_IMMUTABLE)
+    flags.set(BufferAllocationFlag::GpuReadonly);
+  return flags;
+}
+
+static HRESULT
+ValidateSharedBufferDesc(const D3D11_BUFFER_DESC *pDesc) {
+  if (!(pDesc->MiscFlags & (D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX))) {
+    ERR("CreateBuffer: SHARED_NTHANDLE requires SHARED or SHARED_KEYEDMUTEX");
+    return E_INVALIDARG;
+  }
+  if ((pDesc->MiscFlags & D3D11_RESOURCE_MISC_SHARED) && (pDesc->MiscFlags & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX)) {
+    ERR("CreateBuffer: SHARED and SHARED_KEYEDMUTEX are mutually exclusive");
+    return E_INVALIDARG;
+  }
+  if (pDesc->Usage != D3D11_USAGE_DEFAULT && pDesc->Usage != D3D11_USAGE_DYNAMIC &&
+      pDesc->Usage != D3D11_USAGE_IMMUTABLE) {
+    ERR("CreateBuffer: shared buffer with usage ", pDesc->Usage, " is not supported");
+    return E_INVALIDARG;
+  }
+  return S_OK;
+}
+
+static HRESULT
+CreateSharedBuffer(
+    MTLD3D11Device *pDevice, const D3D11_BUFFER_DESC *pDesc, const D3D11_SUBRESOURCE_DATA *pInitialData,
+    ID3D11Buffer **ppBuffer
+) {
+  if (HRESULT hr = ValidateSharedBufferDesc(pDesc); FAILED(hr))
+    return hr;
+  if (!(pDevice->GetLocalD3DKMT() & 0xc0000000)) {
+    ERR("CreateBuffer: Invalid device handle, can't create shared buffer");
+    return E_FAIL;
+  }
+  if (!ppBuffer)
+    return S_FALSE;
+
+  auto flags = SharedBufferAllocationFlags(pDesc);
+  Rc<Buffer> buffer = new Buffer(pDesc->ByteWidth, pDevice->GetMTLDevice());
+  mach_port_t mach_port = 0;
+  auto allocation = buffer->allocateShared(flags, mach_port);
+  if (!allocation) {
+    ERR("CreateBuffer: Failed to allocate shared memory for a ", pDesc->ByteWidth, " bytes shared buffer");
+    return E_OUTOFMEMORY;
+  }
+  if (pDesc->Usage == D3D11_USAGE_DYNAMIC && !allocation->mappedMemory(0)) {
+    ERR("CreateBuffer: shared dynamic buffer is not addressable by this process");
+    return E_INVALIDARG;
+  }
+  if (pInitialData)
+    allocation->updateContents(0, pInitialData->pSysMem, pDesc->ByteWidth);
+
+  SharedResourceData runtimeData = {};
+  MakeUniqueSharedName(runtimeData.mach_port_name);
+  if (!WMTBootstrapRegister(runtimeData.mach_port_name, mach_port)) {
+    ERR("CreateBuffer: Failed to register mach port for shared buffer");
+    return E_FAIL;
+  }
+  runtimeData.dimension = D3D11_RESOURCE_DIMENSION_BUFFER;
+  runtimeData.desc.buffer = *pDesc;
+
+  Rc<KeyedMutex> keyed_mutex = {};
+  if (pDesc->MiscFlags & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX)
+    keyed_mutex = KeyedMutex::create(pDevice->GetMTLDevice());
+  runtimeData.mutex_handle = keyed_mutex ? keyed_mutex->globalHandle() : 0;
+
+  D3DKMT_HANDLE local_kmt, global_kmt;
+  if (FAILED(CreateSharedResourceAllocation(
+          pDevice, runtimeData, pDesc->MiscFlags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE, &local_kmt, &global_kmt
+      ))) {
+    ERR("CreateBuffer: Failed to create D3DKMT for shared buffer");
+    return E_FAIL;
+  }
+
+  auto _ = buffer->rename(std::move(allocation));
+  *ppBuffer = reinterpret_cast<ID3D11Buffer *>(ref(new D3D11Buffer(
+      pDesc, std::move(buffer), flags, local_kmt, global_kmt, std::move(keyed_mutex), pDevice
+  )));
+  return S_OK;
+}
+
+HRESULT
+ImportSharedBuffer(
+    MTLD3D11Device *pDevice, const D3D11_BUFFER_DESC *pDesc, mach_port_t MachPort, D3DKMT_HANDLE hSharedKeyedMutex,
+    REFIID riid, void **ppBuffer
+) {
+  if (pDesc->ByteWidth == 0 || FAILED(ValidateSharedBufferDesc(pDesc))) {
+    ERR("ImportSharedBuffer: Invalid shared buffer description");
+    return E_INVALIDARG;
+  }
+
+  auto flags = SharedBufferAllocationFlags(pDesc);
+  Rc<Buffer> buffer = new Buffer(pDesc->ByteWidth, pDevice->GetMTLDevice());
+  auto allocation = buffer->importShared(flags, MachPort);
+  if (!allocation) {
+    ERR("ImportSharedBuffer: Failed to map shared buffer memory");
+    return E_FAIL;
+  }
+  if (pDesc->Usage == D3D11_USAGE_DYNAMIC && !allocation->mappedMemory(0)) {
+    ERR("ImportSharedBuffer: shared dynamic buffer is not addressable by this process");
+    return E_INVALIDARG;
+  }
+  auto _ = buffer->rename(std::move(allocation));
+
+  Rc<KeyedMutex> keyed_mutex;
+  if (hSharedKeyedMutex & 0xc0000000)
+    keyed_mutex = KeyedMutex::import(pDevice->GetMTLDevice(), hSharedKeyedMutex);
+
+  Com<D3D11Buffer> shared_buffer =
+      ref(new D3D11Buffer(pDesc, std::move(buffer), flags, 0, 0, std::move(keyed_mutex), pDevice));
+  return shared_buffer->QueryInterface(riid, ppBuffer);
+}
+
 HRESULT
 CreateBuffer(
     MTLD3D11Device *pDevice, const D3D11_BUFFER_DESC *pDesc, const D3D11_SUBRESOURCE_DATA *pInitialData,
     ID3D11Buffer **ppBuffer
 ) {
+  if (pDesc->MiscFlags & kSharedResourceMiscFlags)
+    return CreateSharedBuffer(pDevice, pDesc, pInitialData, ppBuffer);
   *ppBuffer = reinterpret_cast<ID3D11Buffer *>(ref(new D3D11Buffer(pDesc, pInitialData, pDevice)));
   return S_OK;
 }
