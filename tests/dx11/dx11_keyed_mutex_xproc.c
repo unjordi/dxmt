@@ -108,12 +108,18 @@ int main(int argc, char **argv) {
     for (int i = 0; i < frames; i++) {
         IDXGIKeyedMutex *km = NULL;
         ID3D11Texture2D_QueryInterface(sync, &IID_IDXGIKeyedMutex, (void **)&km);
-        double t0 = now_ms();
-        hr = IDXGIKeyedMutex_AcquireSync(km, 0, 10);
-        double dt = now_ms() - t0; if (dt > worst) worst = dt;
-        if (hr == S_OK) ok++; else { if (hr == WAIT_TIMEOUT) timeouts++; else other++;
-            if (timeouts + other <= 5) printf("[parent] frame %d AcquireSync(0,10) hr=0x%08lx after %.1f ms\n", i, hr, dt); }
-        if (hr == WAIT_TIMEOUT && dt < 9.0) { early++; if (early <= 5) printf("[parent] frame %d WAIT_TIMEOUT after %.2f ms (requested timeout 10 ms)\n", i, dt); }
+        /* retry until owned: the frame is only written while the parent holds the mutex */
+        for (int attempt = 0; attempt < 50; attempt++) {
+            double t0 = now_ms();
+            hr = IDXGIKeyedMutex_AcquireSync(km, 0, 10);
+            double dt = now_ms() - t0; if (dt > worst) worst = dt;
+            if (hr == S_OK) { ok++; break; }
+            if (hr == WAIT_TIMEOUT) timeouts++; else other++;
+            if (timeouts + other <= 5) printf("[parent] frame %d AcquireSync(0,10) hr=0x%08lx after %.1f ms\n", i, hr, dt);
+            if (hr == WAIT_TIMEOUT && dt < 9.0) { early++; if (early <= 5) printf("[parent] frame %d WAIT_TIMEOUT after %.2f ms (requested timeout 10 ms)\n", i, dt); }
+            if (hr != WAIT_TIMEOUT) break;
+        }
+        if (hr != S_OK) { IDXGIKeyedMutex_Release(km); break; }
         float c[4] = {(i & 0xff) / 255.0f, 0, 0, 1};
         ID3D11DeviceContext_ClearRenderTargetView(ctx, rtv, c);
         ID3D11DeviceContext_Flush(ctx);
@@ -121,7 +127,7 @@ int main(int argc, char **argv) {
         SetEvent(present);
         Sleep(5);
         HRESULT rh = IDXGIKeyedMutex_ReleaseSync(km, 0);
-        if (hr == S_OK && rh != S_OK) { relfail++; if (relfail < 5) printf("[parent] frame %d ReleaseSync hr=0x%08lx\n", i, rh); }
+        if (rh != S_OK) { relfail++; if (relfail < 5) printf("[parent] frame %d ReleaseSync hr=0x%08lx\n", i, rh); }
         IDXGIKeyedMutex_Release(km);
         if (WaitForSingleObject(acquired, 50) != WAIT_OBJECT_0) waitfail++;
         Sleep(6);
