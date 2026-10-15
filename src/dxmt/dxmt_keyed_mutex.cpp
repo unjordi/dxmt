@@ -134,8 +134,9 @@ KeyedMutex::acquire(KeyedMutexAcquire &&func_acquire, uint64_t key, uint32_t mil
   D3DKMT_ACQUIREKEYEDMUTEX acquire = {};
   acquire.hKeyedMutex = local_kmt_;
   acquire.Key = key;
-  acquire.pTimeout = &timeout;
-  timeout.QuadPart = milliseconds * -10000;
+  // relative timeout in 100ns units (negative); NULL waits forever
+  timeout.QuadPart = -10000ll * (LONGLONG)milliseconds;
+  acquire.pTimeout = milliseconds == INFINITE ? nullptr : &timeout;
 
   NTSTATUS status = D3DKMTAcquireKeyedMutex(&acquire);
   if (status == STATUS_TIMEOUT)

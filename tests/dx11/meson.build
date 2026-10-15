@@ -38,3 +38,6 @@ executable('dx11_shared_buffer', ['dx11_shared_buffer.cpp'],
 executable('dx11_shared_texture_xproc', ['dx11_shared_texture_xproc.cpp'],
   dependencies: [ lib_d3d11, lib_dxgi ]
 )
+executable('dx11_keyed_mutex_xproc', ['dx11_keyed_mutex_xproc.c'],
+  dependencies: [ lib_d3d11, lib_dxgi ]
+)
